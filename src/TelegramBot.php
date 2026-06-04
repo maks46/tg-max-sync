@@ -39,7 +39,8 @@ class TelegramBot
                     'timeout' => $timeout,
                     'allowed_updates' => json_encode(['message']),
                 ],
-                'timeout' => $timeout + 5,
+                // cURL timeout must be well above the long-poll timeout
+                'timeout' => $timeout + 15,
             ]);
             $body = json_decode((string)$response->getBody(), true);
             if (!($body['ok'] ?? false)) {
