@@ -1,0 +1,13 @@
+services:
+  sync-bot:
+    build: .
+    container_name: tg-max-sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./storage:/app/storage
+    environment:
+      - TZ=Europe/Moscow
