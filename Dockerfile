@@ -6,7 +6,10 @@ RUN apk add --no-cache \
     libpng-dev \
     libjpeg-turbo-dev \
     libwebp-dev \
-    && docker-php-ext-install pdo pdo_sqlite
+    icu-dev \
+    icu-libs \
+    sqlite-dev \
+    && docker-php-ext-install pdo pdo_sqlite intl
 
 # Install Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer

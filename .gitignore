@@ -1,1 +1,6 @@
 .env
+vendor/
+composer.phar
+data/*.db
+logs/*.log
+storage/
