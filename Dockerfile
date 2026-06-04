@@ -9,7 +9,7 @@ RUN apk add --no-cache \
     icu-dev \
     icu-libs \
     sqlite-dev \
-    && docker-php-ext-install pdo pdo_sqlite intl
+    && docker-php-ext-install pdo pdo_sqlite intl pcntl
 
 # Install Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer

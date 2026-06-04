@@ -2,6 +2,6 @@
 vendor/
 composer.phar
 data/*.db
-logs/*.log
+logs/
 storage/
 .idea

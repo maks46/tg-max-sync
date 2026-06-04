@@ -31,11 +31,30 @@ class SyncWorker
 
     /**
      * Run one full sync cycle (TG → MAX, then MAX → TG).
-     * Called in a loop from worker.php.
+     * Used in single-process fallback mode.
      */
     public function runCycle(): void
     {
         $this->syncTelegramToMax();
+        $this->syncMaxToTelegram();
+    }
+
+    /**
+     * Run only the Telegram → MAX direction.
+     * Used in the parent process of the two-process architecture.
+     */
+    public function runTelegramToMaxCycle(): void
+    {
+        $this->syncTelegramToMax();
+    }
+
+    /**
+     * Run only the MAX → Telegram direction.
+     * Used in the child process of the two-process architecture.
+     * Calls receiveNotification once per invocation (blocks up to 5 s).
+     */
+    public function runMaxToTelegramCycle(): void
+    {
         $this->syncMaxToTelegram();
     }
 
@@ -169,21 +188,47 @@ class SyncWorker
 
     /**
      * Process a single Green API notification body.
+     *
+     * Handled webhook types:
+     *   incomingMessageReceived  – message from another user
+     *   outgoingMessageWebhook   – message sent from the phone linked to the instance
+     *   outgoingAPIMessageWebhook – message sent via API (by this worker itself — skip to avoid echo)
      */
     private function processMaxNotification(array $body): void
     {
-        // We only handle incoming messages
-        if (($body['typeWebhook'] ?? '') !== 'incomingMessageReceived') {
+        $typeWebhook = $body['typeWebhook'] ?? '';
+
+        // For outgoing webhooks chatId is in chatData, for incoming — in senderData
+        $chatId = (string)(
+            $body['chatData']['chatId']   // outgoing
+            ?? $body['senderData']['chatId']  // incoming
+            ?? ''
+        );
+        $msgId = (string)($body['idMessage'] ?? '');
+
+        // Log every notification for diagnostics
+        $this->logger->info("MAX notification: type={$typeWebhook} chatId={$chatId} idMessage={$msgId}");
+
+        // Handled types:
+        //   incomingMessageReceived  – message from another user
+        //   outgoingMessageReceived  – message sent from the linked phone (owner)
+        //   outgoingMessageWebhook   – same, alternative name in some API versions
+        // Skipped: outgoingAPIMessageWebhook – sent by THIS worker via API → avoid echo
+        $handled = [
+            'incomingMessageReceived',
+            'outgoingMessageReceived',
+            'outgoingMessageWebhook',
+        ];
+        if (!in_array($typeWebhook, $handled, true)) {
             return;
         }
 
         // Filter to our target group chat
-        $chatId = (string)($body['senderData']['chatId'] ?? '');
         if ($chatId !== $this->max->getGroupId()) {
+            $this->logger->info("MAX notification: skipping chatId={$chatId} (expected {$this->max->getGroupId()})");
             return;
         }
 
-        $msgId = (string)($body['idMessage'] ?? '');
         if ($msgId === '') {
             return;
         }
@@ -195,7 +240,12 @@ class SyncWorker
 
         $this->logger->info("MAX→TG: processing idMessage={$msgId}");
 
-        $result = $this->forwardMaxToTelegram($body);
+        // For outgoing messages the sender is the instance owner — use wid as name
+        $senderName = $body['senderData']['senderName']
+            ?? $body['senderData']['chatName']
+            ?? ($typeWebhook === 'outgoingMessageWebhook' ? 'MAX (owner)' : 'MAX user');
+
+        $result = $this->forwardMaxToTelegram($body, $senderName);
         if ($result !== null) {
             $targetId = (string)($result['message_id'] ?? '');
             $this->db->markSynced('max', $msgId, 'telegram', $targetId);
@@ -207,8 +257,10 @@ class SyncWorker
 
     /**
      * Forward one MAX notification body to Telegram.
+     *
+     * @param string|null $senderName Override sender name (used for outgoing messages).
      */
-    private function forwardMaxToTelegram(array $body): ?array
+    private function forwardMaxToTelegram(array $body, ?string $senderName = null): ?array
     {
         $info = $this->media->extractMaxMedia($body);
         if ($info === null) {
@@ -216,8 +268,8 @@ class SyncWorker
             return null;
         }
 
-        $senderName = $body['senderData']['senderName'] ?? ($body['senderData']['chatName'] ?? 'MAX user');
-        $caption    = $this->buildCaption($senderName, $info['text'] ?? '');
+        $senderName ??= $body['senderData']['senderName'] ?? ($body['senderData']['chatName'] ?? 'MAX user');
+        $caption      = $this->buildCaption($senderName, $info['text'] ?? '');
 
         return match ($info['type']) {
             'text' => $this->telegram->sendMessage($caption),

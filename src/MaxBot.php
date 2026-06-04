@@ -49,6 +49,52 @@ class MaxBot
     }
 
     // -------------------------------------------------------------------------
+    // Instance setup
+    // -------------------------------------------------------------------------
+
+    /**
+     * Ensure the Green API instance has incomingWebhook enabled.
+     * Called once at worker startup. After setSettings the instance reboots (~30 s).
+     */
+    public function ensureIncomingWebhook(): void
+    {
+        // Read current settings
+        try {
+            $response = $this->http->get($this->buildUrl('getSettings'), ['timeout' => 10]);
+            $settings = json_decode((string)$response->getBody(), true) ?? [];
+        } catch (GuzzleException $e) {
+            $this->logger->error('MAX getSettings error: ' . $e->getMessage());
+            return;
+        }
+
+        $needsUpdate = ($settings['incomingWebhook'] ?? '') !== 'yes'
+            || ($settings['outgoingAPIMessageWebhook'] ?? '') !== 'yes'
+            || ($settings['outgoingMessageWebhook'] ?? '') !== 'yes';
+
+        if (!$needsUpdate) {
+            $this->logger->info('MAX webhooks already enabled');
+            return;
+        }
+
+        $this->logger->info('MAX webhooks not fully enabled — enabling via setSettings');
+
+        try {
+            $this->http->post($this->buildUrl('setSettings'), [
+                'json'    => [
+                    'incomingWebhook'           => 'yes',
+                    'outgoingAPIMessageWebhook'  => 'yes',
+                    'outgoingMessageWebhook'    => 'yes',
+                ],
+                'timeout' => 10,
+            ]);
+            $this->logger->info('MAX setSettings done — instance will reboot, waiting 60 s');
+            sleep(60);
+        } catch (GuzzleException $e) {
+            $this->logger->error('MAX setSettings error: ' . $e->getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Polling  (HTTP-API mode)
     // -------------------------------------------------------------------------
 
@@ -77,10 +123,13 @@ class MaxBot
 
     /**
      * Acknowledge (delete) a processed notification so the queue advances.
+     *
+     * Correct URL: DELETE /waInstance{id}/deleteNotification/{token}/{receiptId}
      */
     public function deleteNotification(int $receiptId): void
     {
-        $url = $this->buildUrl("deleteNotification/{$receiptId}");
+        // Token comes before receiptId in the path
+        $url = "{$this->apiUrl}/waInstance{$this->idInstance}/deleteNotification/{$this->apiToken}/{$receiptId}";
         try {
             $this->http->delete($url, ['timeout' => 10]);
         } catch (GuzzleException $e) {

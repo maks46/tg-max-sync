@@ -90,7 +90,7 @@ class Logger
         echo $line;
 
         $this->rotateIfNeeded();
-        file_put_contents($this->logFile, $line, FILE_APPEND | LOCK_EX);
+        file_put_contents($this->logFile, $line, FILE_APPEND);
     }
 
     /**
