@@ -8,25 +8,39 @@ use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 
 /**
- * Client for the MAX Bot API (https://botapi.max.ru).
+ * Client for the MAX messenger via Green API (https://green-api.com/v3/docs/).
  *
- * API uses marker-based pagination for getUpdates (not offset).
- * Media must be uploaded first via /uploads, then attached to messages.
+ * Green API uses HTTP polling (ReceiveNotification / DeleteNotification) instead
+ * of the old botapi.max.ru approach.
+ *
+ * Request format:
+ *   {{apiUrl}}/waInstance{{idInstance}}/METHOD/{{apiTokenInstance}}
+ *
+ * Credentials required in .env:
+ *   GREEN_API_URL        – e.g. https://api.green-api.com
+ *   GREEN_API_MEDIA_URL  – e.g. https://media.green-api.com
+ *   GREEN_API_INSTANCE   – numeric instance id
+ *   GREEN_API_TOKEN      – apiTokenInstance
+ *   MAX_GROUP_ID         – chatId of the target group (numeric, e.g. -10000000000000)
  */
 class MaxBot
 {
-    private const BASE_URL = 'https://botapi.max.ru';
-
+    private string $apiUrl;
+    private string $mediaUrl;
+    private string $idInstance;
+    private string $apiToken;
     private string $groupId;
-    private string $token;
 
     public function __construct(
         private readonly Config $config,
         private readonly Client $http,
         private readonly Logger $logger,
     ) {
-        $this->token   = $this->config->require('MAX_BOT_TOKEN');
-        $this->groupId = $this->config->require('MAX_GROUP_ID');
+        $this->apiUrl     = rtrim($this->config->require('GREEN_API_URL'), '/');
+        $this->mediaUrl   = rtrim($this->config->require('GREEN_API_MEDIA_URL'), '/');
+        $this->idInstance = $this->config->require('GREEN_API_INSTANCE');
+        $this->apiToken   = $this->config->require('GREEN_API_TOKEN');
+        $this->groupId    = $this->config->require('MAX_GROUP_ID');
     }
 
     public function getGroupId(): string
@@ -35,36 +49,42 @@ class MaxBot
     }
 
     // -------------------------------------------------------------------------
-    // Polling
+    // Polling  (HTTP-API mode)
     // -------------------------------------------------------------------------
 
     /**
-     * Fetch updates from MAX.
-     * Returns ['updates' => [...], 'marker' => int|null]
+     * Receive one notification from the queue (long-poll, up to 5 s).
      *
-     * @param int|null $marker Pass the marker returned by the previous call.
+     * Returns:
+     *   ['receiptId' => int, 'body' => array]  – when a notification is available
+     *   null                                   – queue is empty / timeout
      */
-    public function getUpdates(?int $marker = null): array
+    public function receiveNotification(): ?array
     {
-        $query = ['limit' => 100];
-        if ($marker !== null) {
-            $query['marker'] = $marker;
-        }
-
+        $url = $this->buildUrl('receiveNotification') . '?receiveTimeout=5';
         try {
-            $response = $this->http->get(self::BASE_URL . '/updates', [
-                'query'   => $query,
-                'headers' => $this->authHeaders(),
-                'timeout' => 30,
-            ]);
-            $body = json_decode((string)$response->getBody(), true);
-            return [
-                'updates' => $body['updates'] ?? [],
-                'marker'  => $body['marker']  ?? null,
-            ];
+            $response = $this->http->get($url, ['timeout' => 10]);
+            $data = json_decode((string)$response->getBody(), true);
+            if (empty($data)) {
+                return null;
+            }
+            return $data;
         } catch (GuzzleException $e) {
-            $this->logger->error('MAX getUpdates error: ' . $e->getMessage());
-            return ['updates' => [], 'marker' => $marker];
+            $this->logger->error('MAX receiveNotification error: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Acknowledge (delete) a processed notification so the queue advances.
+     */
+    public function deleteNotification(int $receiptId): void
+    {
+        $url = $this->buildUrl("deleteNotification/{$receiptId}");
+        try {
+            $this->http->delete($url, ['timeout' => 10]);
+        } catch (GuzzleException $e) {
+            $this->logger->error("MAX deleteNotification({$receiptId}) error: " . $e->getMessage());
         }
     }
 
@@ -77,149 +97,103 @@ class MaxBot
      */
     public function sendMessage(string $text, ?string $chatId = null): array
     {
-        return $this->post('/messages', [
-            'text' => $text,
-        ], $chatId);
+        return $this->postJson('sendMessage', [
+            'chatId'  => $chatId ?? $this->groupId,
+            'message' => $text,
+        ]);
     }
 
     /**
-     * Send a photo. $source is a local file path.
-     * The file is uploaded first, then attached to the message.
+     * Send a photo (or any image) from a local file path.
      */
     public function sendPhoto(string $localPath, string $caption = '', ?string $chatId = null): array
     {
-        $token = $this->uploadMedia($localPath, 'image');
-        if ($token === null) {
-            return [];
-        }
-
-        $body = [
-            'attachments' => [
-                [
-                    'type'    => 'image',
-                    'payload' => ['token' => $token],
-                ],
-            ],
-        ];
-        if ($caption !== '') {
-            $body['text'] = $caption;
-        }
-
-        return $this->post('/messages', $body, $chatId);
+        return $this->sendFileByUpload($localPath, $caption, $chatId);
     }
 
     /**
-     * Send a video. $source is a local file path.
+     * Send a video from a local file path.
      */
     public function sendVideo(string $localPath, string $caption = '', ?string $chatId = null): array
     {
-        $token = $this->uploadMedia($localPath, 'video');
-        if ($token === null) {
-            return [];
-        }
-
-        $body = [
-            'attachments' => [
-                [
-                    'type'    => 'video',
-                    'payload' => ['token' => $token],
-                ],
-            ],
-        ];
-        if ($caption !== '') {
-            $body['text'] = $caption;
-        }
-
-        return $this->post('/messages', $body, $chatId);
+        return $this->sendFileByUpload($localPath, $caption, $chatId);
     }
 
     /**
-     * Send a video note (circle video). MAX doesn't have a separate type;
-     * we send it as a regular video with the "video_note" flag in payload.
+     * Send a video note (circle video). Green API has no special type; send as video.
      */
     public function sendVideoNote(string $localPath, ?string $chatId = null): array
     {
-        // Upload as video; MAX doesn't distinguish circle videos natively
-        return $this->sendVideo($localPath, '', $chatId);
+        return $this->sendFileByUpload($localPath, '', $chatId);
     }
 
-    // -------------------------------------------------------------------------
-    // Media upload
-    // -------------------------------------------------------------------------
-
     /**
-     * Upload a local file to MAX and return the reusable token.
+     * Upload and send any file via multipart/form-data (sendFileByUpload).
      *
-     * @param string $type  'image' | 'video' | 'file'
-     * @return string|null  Token to use in attachment payload, or null on error.
+     * POST {{mediaUrl}}/waInstance{{idInstance}}/sendFileByUpload/{{apiTokenInstance}}
+     * form-data: chatId, file (binary), fileName, caption
      */
-    public function uploadMedia(string $localPath, string $type): ?string
+    public function sendFileByUpload(string $localPath, string $caption = '', ?string $chatId = null): array
     {
-        // Step 1: get an upload URL from MAX
+        $url      = $this->buildMediaUrl('sendFileByUpload');
+        $fileName = basename($localPath);
+        $mime     = $this->mimeType($localPath);
+
+        $multipart = [
+            ['name' => 'chatId',   'contents' => $chatId ?? $this->groupId],
+            ['name' => 'fileName', 'contents' => $fileName],
+            ['name' => 'file',     'contents' => fopen($localPath, 'rb'), 'filename' => $fileName, 'headers' => ['Content-Type' => $mime]],
+        ];
+        if ($caption !== '') {
+            $multipart[] = ['name' => 'caption', 'contents' => $caption];
+        }
+
         try {
-            $response = $this->http->post(self::BASE_URL . '/uploads', [
-                'query'   => ['type' => $type],
-                'headers' => $this->authHeaders(),
-                'timeout' => 15,
+            $response = $this->http->post($url, [
+                'multipart' => $multipart,
+                'timeout'   => 120,
             ]);
-            $info = json_decode((string)$response->getBody(), true);
+            return json_decode((string)$response->getBody(), true) ?? [];
         } catch (GuzzleException $e) {
-            $this->logger->error("MAX uploadMedia (get URL) error: {$e->getMessage()}");
-            return null;
+            $this->logger->error("MAX sendFileByUpload error: {$e->getMessage()}");
+            return [];
         }
-
-        $uploadUrl = $info['url'] ?? null;
-        if (!$uploadUrl) {
-            $this->logger->error('MAX uploadMedia: no upload URL in response', $info);
-            return null;
-        }
-
-        // Step 2: PUT the file to the upload URL
-        try {
-            $response = $this->http->put($uploadUrl, [
-                'body'    => fopen($localPath, 'rb'),
-                'headers' => ['Content-Type' => $this->mimeType($localPath)],
-                'timeout' => 120,
-            ]);
-            $result = json_decode((string)$response->getBody(), true);
-        } catch (GuzzleException $e) {
-            $this->logger->error("MAX uploadMedia (PUT) error: {$e->getMessage()}");
-            return null;
-        }
-
-        // The token can be at different keys depending on media type
-        return $result['token']
-            ?? $result['fileId']
-            ?? $result['id']
-            ?? null;
     }
 
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    private function authHeaders(): array
+    /**
+     * Build a standard API URL: {{apiUrl}}/waInstance{{idInstance}}/METHOD/{{apiTokenInstance}}
+     */
+    private function buildUrl(string $method): string
     {
-        return ['Authorization' => 'Bearer ' . $this->token];
+        return "{$this->apiUrl}/waInstance{$this->idInstance}/{$method}/{$this->apiToken}";
     }
 
     /**
-     * POST JSON to a MAX API endpoint.
+     * Build a media API URL using the media endpoint (for file uploads).
      */
-    private function post(string $path, array $body, ?string $chatId = null): array
+    private function buildMediaUrl(string $method): string
     {
-        $chatId ??= $this->groupId;
+        return "{$this->mediaUrl}/waInstance{$this->idInstance}/{$method}/{$this->apiToken}";
+    }
 
+    /**
+     * POST JSON to a Green API endpoint and return decoded response.
+     */
+    private function postJson(string $method, array $body): array
+    {
+        $url = $this->buildUrl($method);
         try {
-            $response = $this->http->post(self::BASE_URL . $path, [
-                'query'   => ['chat_id' => $chatId],
+            $response = $this->http->post($url, [
                 'json'    => $body,
-                'headers' => $this->authHeaders(),
                 'timeout' => 30,
             ]);
             return json_decode((string)$response->getBody(), true) ?? [];
         } catch (GuzzleException $e) {
-            $this->logger->error("MAX POST {$path} error: {$e->getMessage()}");
+            $this->logger->error("MAX POST {$method} error: {$e->getMessage()}");
             return [];
         }
     }

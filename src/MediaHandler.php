@@ -73,42 +73,45 @@ class MediaHandler
     }
 
     /**
-     * Extract media info from a MAX message update.
+     * Extract media info from a Green API notification body.
      *
-     * Returns same shape as extractTelegramMedia(), but uses MAX-specific
-     * attachment structure. The 'url' key holds a direct download URL for media.
+     * Green API format (incomingMessageReceived):
+     *   body.messageData.typeMessage  = textMessage | imageMessage | videoMessage | documentMessage | ...
+     *   body.messageData.textMessageData.textMessage
+     *   body.messageData.fileMessageData.downloadUrl
+     *   body.messageData.fileMessageData.caption
      *
-     * Returns null if unsupported.
+     * Returns same shape as extractTelegramMedia():
+     *   ['type' => 'text'|'photo'|'video', 'text' => string, 'url' => string|null]
+     *
+     * Returns null if unsupported type.
      */
-    public function extractMaxMedia(array $message): ?array
+    public function extractMaxMedia(array $body): ?array
     {
-        $text        = $message['body']['text'] ?? '';
-        $attachments = $message['body']['attachments'] ?? [];
+        $messageData = $body['messageData'] ?? [];
+        $typeMessage = $messageData['typeMessage'] ?? '';
 
-        // No attachments → plain text
-        if (empty($attachments)) {
-            if ($text === '') {
-                return null;
-            }
-            return ['type' => 'text', 'text' => $text];
-        }
+        return match ($typeMessage) {
+            'textMessage', 'extendedTextMessage' => [
+                'type' => 'text',
+                'text' => $messageData['textMessageData']['textMessage']
+                    ?? $messageData['extendedTextMessageData']['text']
+                    ?? '',
+            ],
 
-        // Use first attachment
-        $attachment = $attachments[0];
-        $type       = $attachment['type'] ?? '';
-        $payload    = $attachment['payload'] ?? [];
-
-        return match ($type) {
-            'image' => [
+            'imageMessage' => [
                 'type' => 'photo',
-                'url'  => $payload['url'] ?? ($payload['photo']['url'] ?? null),
-                'text' => $text,
+                'url'  => $messageData['fileMessageData']['downloadUrl'] ?? null,
+                'text' => $messageData['fileMessageData']['caption'] ?? '',
             ],
-            'video' => [
+
+            'videoMessage' => [
                 'type' => 'video',
-                'url'  => $payload['url'] ?? null,
-                'text' => $text,
+                'url'  => $messageData['fileMessageData']['downloadUrl'] ?? null,
+                'text' => $messageData['fileMessageData']['caption'] ?? '',
             ],
+
+            // documentMessage, audioMessage, etc. – skip
             default => null,
         };
     }

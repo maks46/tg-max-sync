@@ -5,20 +5,20 @@ declare(strict_types=1);
 namespace App;
 
 /**
- * Orchestrates bidirectional sync between Telegram and MAX.
+ * Orchestrates bidirectional sync between Telegram and MAX (via Green API).
  *
  * Direction TG → MAX:
  *   Long-poll Telegram getUpdates → for each new message in the target group
  *   that hasn't been synced yet → forward to MAX → record in DB.
  *
  * Direction MAX → TG:
- *   Poll MAX /updates with marker → for each new message in the target chat
- *   that hasn't been synced yet → forward to Telegram → record in DB.
+ *   Poll Green API receiveNotification (HTTP-API, FIFO queue) →
+ *   filter incomingMessageReceived for the target chatId →
+ *   forward to Telegram → deleteNotification → record in DB.
  */
 class SyncWorker
 {
-    private int $tgOffset   = 0;
-    private ?int $maxMarker = null;
+    private int $tgOffset = 0;
 
     public function __construct(
         private readonly TelegramBot  $telegram,
@@ -71,10 +71,9 @@ class SyncWorker
 
             $result = $this->forwardTelegramToMax($message);
             if ($result !== null) {
-                $targetId = (string)($result['id'] ?? $result['message_id'] ?? '');
-                // Record: telegram msgId was synced to max targetId
+                // Green API sendMessage / sendFileByUpload returns {"idMessage": "..."}
+                $targetId = (string)($result['idMessage'] ?? '');
                 $this->db->markSynced('telegram', $msgId, 'max', $targetId);
-                // Prevent the reflected MAX message from being re-forwarded back
                 if ($targetId !== '') {
                     $this->db->markSynced('max', $targetId, 'telegram', $msgId);
                 }
@@ -84,7 +83,6 @@ class SyncWorker
 
     /**
      * Forward one Telegram message to MAX.
-     * Returns the MAX API response array, or null on failure / unsupported type.
      */
     private function forwardTelegramToMax(array $message): ?array
     {
@@ -95,24 +93,29 @@ class SyncWorker
         }
 
         $senderName = $this->getSenderName($message);
-        $prefix     = "[{$senderName}]: ";
+        $caption    = $this->buildCaption($senderName, $info['text'] ?? '');
 
         return match ($info['type']) {
-            'text' => $this->max->sendMessage($prefix . $info['text']),
+            'text' => $this->max->sendMessage($caption),
 
             'photo' => $this->handleTgMediaToMax(
                 $info['file_id'],
-                fn(string $path) => $this->max->sendPhoto($path, $prefix . $info['text']),
+                fn(string $path) => $this->max->sendPhoto($path, $caption),
             ),
 
             'video' => $this->handleTgMediaToMax(
                 $info['file_id'],
-                fn(string $path) => $this->max->sendVideo($path, $prefix . $info['text']),
+                fn(string $path) => $this->max->sendVideo($path, $caption),
             ),
 
+            // Video notes have no caption — send author line as a separate text message first,
+            // then send the video note itself.
             'video_note' => $this->handleTgMediaToMax(
                 $info['file_id'],
-                fn(string $path) => $this->max->sendVideoNote($path),
+                function (string $path) use ($senderName): array {
+                    $this->max->sendMessage("[{$senderName}] прислал видеозаметку:");
+                    return $this->max->sendVideoNote($path);
+                },
             ),
 
             default => null,
@@ -121,7 +124,6 @@ class SyncWorker
 
     /**
      * Download a Telegram file and pass the local path to $send callback.
-     * Cleans up the temp file afterwards.
      */
     private function handleTgMediaToMax(string $fileId, callable $send): ?array
     {
@@ -139,79 +141,95 @@ class SyncWorker
     }
 
     // -------------------------------------------------------------------------
-    // MAX → Telegram
+    // MAX → Telegram  (Green API HTTP-API polling)
     // -------------------------------------------------------------------------
 
     private function syncMaxToTelegram(): void
     {
-        $result = $this->max->getUpdates($this->maxMarker);
-
-        $updates         = $result['updates'] ?? [];
-        $this->maxMarker = $result['marker']  ?? $this->maxMarker;
-
-        foreach ($updates as $update) {
-            if (($update['update_type'] ?? '') !== 'message_created') {
-                continue;
+        // Green API returns one notification per call; loop until queue is empty.
+        while (true) {
+            $notification = $this->max->receiveNotification();
+            if ($notification === null) {
+                break; // queue empty or timeout
             }
 
-            $message = $update['message'] ?? null;
-            if ($message === null) {
-                continue;
-            }
+            $receiptId = (int)($notification['receiptId'] ?? 0);
+            $body      = $notification['body'] ?? [];
 
-            $chatId = (string)($message['recipient']['chat_id'] ?? '');
-            if ($chatId !== $this->max->getGroupId()) {
-                continue;
-            }
-
-            $msgId = (string)($message['body']['mid'] ?? '');
-            if ($msgId === '') {
-                continue;
-            }
-
-            // Skip if this message was forwarded FROM telegram (echo prevention)
-            if ($this->db->isSynced('max', $msgId, 'telegram')) {
-                continue;
-            }
-
-            $this->logger->info("MAX→TG: processing mid={$msgId}");
-
-            $result2 = $this->forwardMaxToTelegram($message);
-            if ($result2 !== null) {
-                $targetId = (string)($result2['message_id'] ?? '');
-                $this->db->markSynced('max', $msgId, 'telegram', $targetId);
-                if ($targetId !== '') {
-                    $this->db->markSynced('telegram', $targetId, 'max', $msgId);
+            try {
+                $this->processMaxNotification($body);
+            } finally {
+                // Always acknowledge, even on processing errors, to avoid infinite replay.
+                if ($receiptId > 0) {
+                    $this->max->deleteNotification($receiptId);
                 }
             }
         }
     }
 
     /**
-     * Forward one MAX message to Telegram.
+     * Process a single Green API notification body.
      */
-    private function forwardMaxToTelegram(array $message): ?array
+    private function processMaxNotification(array $body): void
     {
-        $info = $this->media->extractMaxMedia($message);
+        // We only handle incoming messages
+        if (($body['typeWebhook'] ?? '') !== 'incomingMessageReceived') {
+            return;
+        }
+
+        // Filter to our target group chat
+        $chatId = (string)($body['senderData']['chatId'] ?? '');
+        if ($chatId !== $this->max->getGroupId()) {
+            return;
+        }
+
+        $msgId = (string)($body['idMessage'] ?? '');
+        if ($msgId === '') {
+            return;
+        }
+
+        // Skip if this message was forwarded FROM telegram (echo prevention)
+        if ($this->db->isSynced('max', $msgId, 'telegram')) {
+            return;
+        }
+
+        $this->logger->info("MAX→TG: processing idMessage={$msgId}");
+
+        $result = $this->forwardMaxToTelegram($body);
+        if ($result !== null) {
+            $targetId = (string)($result['message_id'] ?? '');
+            $this->db->markSynced('max', $msgId, 'telegram', $targetId);
+            if ($targetId !== '') {
+                $this->db->markSynced('telegram', $targetId, 'max', $msgId);
+            }
+        }
+    }
+
+    /**
+     * Forward one MAX notification body to Telegram.
+     */
+    private function forwardMaxToTelegram(array $body): ?array
+    {
+        $info = $this->media->extractMaxMedia($body);
         if ($info === null) {
             $this->logger->info('MAX→TG: unsupported message type, skipping');
             return null;
         }
 
-        $senderName = $message['sender']['name'] ?? 'MAX user';
-        $prefix     = "[{$senderName}]: ";
+        $senderName = $body['senderData']['senderName'] ?? ($body['senderData']['chatName'] ?? 'MAX user');
+        $caption    = $this->buildCaption($senderName, $info['text'] ?? '');
 
         return match ($info['type']) {
-            'text' => $this->telegram->sendMessage($prefix . $info['text']),
+            'text' => $this->telegram->sendMessage($caption),
 
             'photo' => $this->handleMaxMediaToTg(
                 $info['url'] ?? '',
-                fn(string $path) => $this->telegram->sendPhoto($path, $prefix . $info['text']),
+                fn(string $path) => $this->telegram->sendPhoto($path, $caption),
             ),
 
             'video' => $this->handleMaxMediaToTg(
                 $info['url'] ?? '',
-                fn(string $path) => $this->telegram->sendVideo($path, $prefix . $info['text']),
+                fn(string $path) => $this->telegram->sendVideo($path, $caption),
             ),
 
             default => null,
@@ -253,5 +271,20 @@ class SyncWorker
             $from['last_name']  ?? '',
         ]);
         return implode(' ', $parts) ?: ($from['username'] ?? 'TG user');
+    }
+
+    /**
+     * Build the caption/text that will be prepended to every forwarded message.
+     *
+     * Format:
+     *   "[Author]: message text"   – when the original message has text
+     *   "[Author]"                 – when there is no text (photo/video without caption)
+     */
+    private function buildCaption(string $senderName, string $text): string
+    {
+        $text = trim($text);
+        return $text !== ''
+            ? "[{$senderName}]: {$text}"
+            : "[{$senderName}]";
     }
 }

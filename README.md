@@ -19,8 +19,8 @@
 - Docker + Docker Compose
 - **Telegram-бот** с правами администратора в целевой группе  
   → создать через [@BotFather](https://t.me/BotFather), отключить режим Privacy Mode
-- **MAX-бот** с правами администратора в целевой группе  
-  → создать через платформу MAX, получить токен
+- **Green API аккаунт** для доступа к MAX messenger  
+  → зарегистрировать инстанс на [console.green-api.com](https://console.green-api.com), получить `idInstance` и `apiTokenInstance`
 
 ---
 
@@ -39,13 +39,18 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=123456:ABC-ваш-токен
 TELEGRAM_GROUP_ID=-1001234567890      # отрицательное число для супергрупп
 
-# MAX
-MAX_BOT_TOKEN=ваш-токен-max
-MAX_GROUP_ID=123456789                # ID чата/группы в MAX
+# Green API для MAX messenger
+GREEN_API_URL=https://api.green-api.com
+GREEN_API_MEDIA_URL=https://media.green-api.com
+GREEN_API_INSTANCE=3100000000         # idInstance из кабинета Green API
+GREEN_API_TOKEN=ваш-apiTokenInstance  # apiTokenInstance из кабинета Green API
+
+# Целевой чат MAX (числовой ID, отрицательный для групп)
+MAX_GROUP_ID=-10000000000000
 
 # Опционально
 LOG_LEVEL=info          # debug | info | warning | error
-SYNC_INTERVAL=2         # секунд между циклами опроса MAX
+SYNC_INTERVAL=2         # секунд между циклами опроса
 ```
 
 ### 2. Установить зависимости PHP (локально, для разработки)
@@ -93,7 +98,9 @@ docker compose down
 
 ## Как найти ID группы MAX
 
-Отправить сообщение в группу и проверить поле `recipient.chat_id` в ответе `/updates`.
+1. Зайти в [console.green-api.com](https://console.green-api.com) → выбрать инстанс → раздел **Журнал входящих**.
+2. Отправить любое сообщение в целевую группу MAX.
+3. В журнале найти уведомление `incomingMessageReceived` → поле `senderData.chatId` — это и есть ID группы (отрицательное число для групповых чатов).
 
 ---
 
@@ -125,12 +132,16 @@ tg-max/
 ## Принцип работы
 
 1. **Telegram → MAX**: воркер вызывает `getUpdates` с long-polling (таймаут 25 с).  
-   Каждое новое сообщение из настроенной группы, которого ещё нет в таблице `synced_messages`, пересылается в MAX, после чего записывается в БД с обеих сторон — для предотвращения эхо-петли.
+   Каждое новое сообщение из настроенной группы, которого ещё нет в таблице `synced_messages`, пересылается в MAX через Green API (`sendMessage` / `sendFileByUpload`), после чего записывается в БД с обеих сторон — для предотвращения эхо-петли.
 
-2. **MAX → Telegram**: после каждого цикла опроса Telegram воркер запрашивает MAX `/updates` с маркером курсора.  
-   Та же логика дедупликации.
+2. **MAX → Telegram**: после каждого TG-цикла воркер вызывает `receiveNotification` (Green API HTTP-API, FIFO-очередь, ожидание 5 с).  
+   Уведомления вида `incomingMessageReceived` из целевого чата пересылаются в Telegram.  
+   После обработки каждое уведомление подтверждается вызовом `deleteNotification`.
 
 3. **Медиа**: файлы скачиваются в `/app/storage`, пересылаются, затем удаляются.
+
+> **Важно**: в Green API инстанс должен работать в режиме **HTTP API** (без `webhookUrl`).  
+> Если `webhookUrl` установлен, `receiveNotification` вернёт ошибку. Очистить можно в кабинете или методом `SetSettings`.
 
 ---
 
@@ -153,8 +164,11 @@ LOG_MAX_FILES=5     # сколько архивных файлов хранит�
 
 | Симптом | Вероятная причина |
 |---------|-------------------|
-| Сообщения не появляются | Бот не является администратором / включён Privacy Mode в TG |
+| Сообщения из MAX не появляются в TG | Инстанс не авторизован в MAX / не включена настройка `incomingWebhook` |
+| `receiveNotification` возвращает ошибку про webhookUrl | В кабинете Green API установлен `webhookUrl` — очистить и подождать ~1 мин |
+| Сообщения из TG не появляются в MAX | Неверный `MAX_GROUP_ID` или `GREEN_API_TOKEN` |
 | Ошибка `Required config key` | Не заполнено значение в `.env` |
-| Ошибка загрузки медиа в MAX | Проверить токен MAX и ID группы |
+| Ошибка 403 при отправке файла | Превышен тариф / инстанс деактивирован |
+| Сообщения не появляются в TG | Бот не администратор / включён Privacy Mode в Telegram |
 | Дублирование сообщений | Файл БД был удалён — уже виденные сообщения синхронизируются один раз заново |
 | Лог не ротируется | Проверить права на запись в `./logs/` |
