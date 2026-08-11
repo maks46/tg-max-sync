@@ -9,5 +9,9 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./storage:/app/storage
+      # Mount the xray directory. Place your config as ./xray/config.json
+      # (copy from xray/config.json.example and fill in server details).
+      # If the file is absent xray is skipped; remove this line to disable entirely.
+      - ./xray:/app/xray:ro
     environment:
       - TZ=Europe/Moscow

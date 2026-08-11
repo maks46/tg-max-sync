@@ -51,6 +51,9 @@ MAX_GROUP_ID=-10000000000000
 # Опционально
 LOG_LEVEL=info          # debug | info | warning | error
 SYNC_INTERVAL=2         # секунд между циклами опроса
+
+# Proxy для xray (если используется xray/config.json)
+TELEGRAM_PROXY=socks5h://127.0.0.1:10808
 ```
 
 ### 2. Установить зависимости PHP (локально, для разработки)
@@ -142,6 +145,66 @@ tg-max/
 
 > **Важно**: в Green API инстанс должен работать в режиме **HTTP API** (без `webhookUrl`).  
 > Если `webhookUrl` установлен, `receiveNotification` вернёт ошибку. Очистить можно в кабинете или методом `SetSettings`.
+
+---
+
+## Доступ к Telegram через xray (VPN)
+
+Если сервер не имеет прямого доступа к `api.telegram.org` (например, в РФ), используйте встроенный **xray-core** — так же, как в приложении happ на Android.
+
+xray-core включён в Docker-образ. Он запускается автоматически при наличии файла `xray/config.json` и поднимает локальный SOCKS5 на `127.0.0.1:10808`. PHP-воркер направляет через него только запросы к Telegram; Green API (MAX) всегда подключается напрямую.
+
+### Быстрый старт
+
+**1. Создать конфиг xray:**
+
+```bash
+cp xray/config.json.example xray/config.json
+```
+
+Заполнить `xray/config.json` данными своего сервера (см. ниже).
+
+**2. Убедиться, что в `.env` задан proxy:**
+
+```dotenv
+TELEGRAM_PROXY=socks5h://127.0.0.1:10808
+```
+
+**3. Пересобрать и запустить:**
+
+```bash
+docker compose up -d --build
+```
+
+Логи xray пишутся в `./logs/xray.log`.
+
+### Получение конфига из happ
+
+1. Открыть happ → выбрать сервер → ⋮ → **Share / Export config**.
+2. Скопировать JSON-конфиг.
+3. Вставить содержимое в `xray/config.json`, **оставив inbounds без изменений** (порт 10808, SOCKS5).
+
+> Альтернативно: вставьте ваш `outbounds` и `routing` поверх шаблона из `xray/config.json.example`.
+
+### Поддерживаемые протоколы
+
+| Протокол | Примечание |
+|----------|-----------|
+| VLESS + REALITY | рекомендуется (как в happ по умолчанию) |
+| VLESS + TLS | стандартный VLESS |
+| VMess | классический протокол xray/v2ray |
+| Trojan | |
+| Shadowsocks | |
+
+### Отключение xray
+
+Удалите или переименуйте `xray/config.json` и очистите переменную:
+
+```dotenv
+TELEGRAM_PROXY=
+```
+
+Supervisord обнаружит отсутствие файла, пропустит запуск xray и воркер выйдет в интернет напрямую.
 
 ---
 

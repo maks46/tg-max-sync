@@ -59,11 +59,28 @@ $stack->push(function (callable $handler) use ($logger): callable {
     };
 });
 
-$http = new Client([
+// Build Guzzle options; add proxy for Telegram API calls if configured.
+$httpOptions = [
     'handler' => $stack,
     'verify'  => true,
     'headers' => ['Accept' => 'application/json'],
-]);
+];
+
+$telegramProxy = $config->get('TELEGRAM_PROXY', '');
+if ($telegramProxy !== '' && $telegramProxy !== false) {
+    // Route only api.telegram.org through the proxy;
+    // all other hosts (Green API, etc.) connect directly.
+    $httpOptions['proxy'] = [
+        'https' => $telegramProxy,
+        'http'  => $telegramProxy,
+        // Hosts that must bypass the proxy (space- or comma-separated list
+        // is not supported by Guzzle; use NO_PROXY env var for exclusions).
+        'no'    => 'api.green-api.com,media.green-api.com',
+    ];
+    $logger->info("Telegram API proxy enabled: {$telegramProxy}");
+}
+
+$http = new Client($httpOptions);
 
 $db       = Database::getInstance();
 $telegram = new TelegramBot($config, $http, $logger);

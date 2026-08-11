@@ -5,3 +5,5 @@ data/*.db
 logs/
 storage/
 .idea
+# xray config contains server credentials — never commit it
+xray/config.json

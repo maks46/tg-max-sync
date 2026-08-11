@@ -1,8 +1,12 @@
 FROM php:8.3-cli-alpine
 
+# ── xray-core version (override at build time: --build-arg XRAY_VERSION=1.8.x) ──
+ARG XRAY_VERSION=25.3.6
+
 RUN apk add --no-cache \
     supervisor \
     curl \
+    unzip \
     libpng-dev \
     libjpeg-turbo-dev \
     libwebp-dev \
@@ -10,6 +14,22 @@ RUN apk add --no-cache \
     icu-libs \
     sqlite-dev \
     && docker-php-ext-install pdo pdo_sqlite intl pcntl
+
+# ── Install xray-core ──────────────────────────────────────────────────────────
+# Detect CPU arch and pick the matching release asset.
+RUN ARCH=$(uname -m) && \
+    case "$ARCH" in \
+      x86_64)  XRAY_ARCH="64" ;; \
+      aarch64) XRAY_ARCH="arm64-v8a" ;; \
+      armv7l)  XRAY_ARCH="arm32-v7a" ;; \
+      *)       echo "Unsupported arch: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL \
+      "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip" \
+      -o /tmp/xray.zip && \
+    unzip -q /tmp/xray.zip xray -d /usr/local/bin/ && \
+    chmod +x /usr/local/bin/xray && \
+    rm /tmp/xray.zip
 
 # Install Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
