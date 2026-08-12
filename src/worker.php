@@ -24,6 +24,32 @@ $logger = Logger::getInstance();
 
 $logger->info('Sync worker starting');
 
+// ── Wait for SOCKS5 proxy to become available ────────────────────────────────
+// Xray may still be starting when this process launches. Poll the proxy port
+// until it accepts connections (max 30 s) before creating the HTTP client.
+if (($proxy = $config->get('TELEGRAM_PROXY', '')) !== '' && $proxy !== false) {
+    $proxyHost = '127.0.0.1';
+    $proxyPort = 10808;
+    // Extract port from proxy URL if present (e.g. socks5h://127.0.0.1:10808)
+    if (preg_match('/:(\d+)$/', $proxy, $m)) {
+        $proxyPort = (int)$m[1];
+    }
+    $waited = 0;
+    while ($waited < 30) {
+        $sock = @fsockopen($proxyHost, $proxyPort, $errno, $errstr, 1);
+        if ($sock !== false) {
+            fclose($sock);
+            $logger->info("Proxy {$proxyHost}:{$proxyPort} is ready (waited {$waited}s)");
+            break;
+        }
+        sleep(2);
+        $waited += 2;
+    }
+    if ($waited >= 30) {
+        $logger->warning("Proxy {$proxyHost}:{$proxyPort} not ready after 30s, continuing anyway");
+    }
+}
+
 // ── HTTP client with request/response logging ─────────────────────────────────
 $stack = HandlerStack::create();
 
@@ -68,14 +94,12 @@ $httpOptions = [
 
 $telegramProxy = $config->get('TELEGRAM_PROXY', '');
 if ($telegramProxy !== '' && $telegramProxy !== false) {
-    // Route only api.telegram.org through the proxy;
-    // all other hosts (Green API, etc.) connect directly.
+    // Route all traffic (Telegram and Green API) through the proxy.
+    // DNS is resolved by the proxy (socks5h), so external hosts are reachable
+    // even when the container's system DNS cannot resolve them directly.
     $httpOptions['proxy'] = [
         'https' => $telegramProxy,
         'http'  => $telegramProxy,
-        // Hosts that must bypass the proxy (space- or comma-separated list
-        // is not supported by Guzzle; use NO_PROXY env var for exclusions).
-        'no'    => 'api.green-api.com,media.green-api.com',
     ];
     $logger->info("Telegram API proxy enabled: {$telegramProxy}");
 }

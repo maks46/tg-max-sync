@@ -107,15 +107,23 @@ class MaxBot
      */
     public function receiveNotification(): ?array
     {
-        $url = $this->buildUrl('receiveNotification') . '?receiveTimeout=5';
+        $receiveTimeout = 5;
+        $url = $this->buildUrl('receiveNotification') . "?receiveTimeout={$receiveTimeout}";
         try {
-            $response = $this->http->get($url, ['timeout' => 10]);
+            $response = $this->http->get($url, ['timeout' => $receiveTimeout + 10]);
             $data = json_decode((string)$response->getBody(), true);
             if (empty($data)) {
                 return null;
             }
             return $data;
         } catch (GuzzleException $e) {
+            // cURL error 28 = connection timeout — expected when the long-poll queue is
+            // empty and the server closes the connection after receiveTimeout seconds.
+            // Log as debug to avoid flooding the error log with normal idle cycles.
+            if (str_contains($e->getMessage(), 'cURL error 28')) {
+                $this->logger->debug('MAX receiveNotification: long-poll timeout (queue empty)');
+                return null;
+            }
             $this->logger->error('MAX receiveNotification error: ' . $e->getMessage());
             return null;
         }
