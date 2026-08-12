@@ -152,59 +152,58 @@ tg-max/
 
 Если сервер не имеет прямого доступа к `api.telegram.org` (например, в РФ), используйте встроенный **xray-core** — так же, как в приложении happ на Android.
 
-xray-core включён в Docker-образ. Он запускается автоматически при наличии файла `xray/config.json` и поднимает локальный SOCKS5 на `127.0.0.1:10808`. PHP-воркер направляет через него только запросы к Telegram; Green API (MAX) всегда подключается напрямую.
+xray-core включён в Docker-образ. При старте контейнера автоматически запускается скрипт `xray/update-config.php`, который скачивает подписку, парсит нужный сервер и записывает `xray/config.json`. Затем стартует xray и поднимает локальный SOCKS5 на `127.0.0.1:10808`. PHP-воркер направляет через него только запросы к Telegram; Green API (MAX) всегда подключается напрямую.
 
-### Быстрый старт
+### Способ A — URL подписки (рекомендуется, как в happ)
 
-**1. Создать конфиг xray:**
+Добавьте в `.env`:
+
+```dotenv
+XRAY_SUBSCRIPTION_URL=https://your-provider.example.com/sub/ваш-токен
+XRAY_SERVER_INDEX=0          # какой сервер из списка использовать (0 = первый)
+TELEGRAM_PROXY=socks5h://127.0.0.1:10808
+```
+
+При каждом перезапуске контейнера конфиг обновляется автоматически.  
+Логи скачивания — `./logs/xray-update.log`.
+
+### Способ Б — ручной конфиг
 
 ```bash
 cp xray/config.json.example xray/config.json
 ```
 
-Заполнить `xray/config.json` данными своего сервера (см. ниже).
-
-**2. Убедиться, что в `.env` задан proxy:**
-
-```dotenv
-TELEGRAM_PROXY=socks5h://127.0.0.1:10808
-```
-
-**3. Пересобрать и запустить:**
-
-```bash
-docker compose up -d --build
-```
-
-Логи xray пишутся в `./logs/xray.log`.
-
-### Получение конфига из happ
-
-1. Открыть happ → выбрать сервер → ⋮ → **Share / Export config**.
-2. Скопировать JSON-конфиг.
-3. Вставить содержимое в `xray/config.json`, **оставив inbounds без изменений** (порт 10808, SOCKS5).
-
-> Альтернативно: вставьте ваш `outbounds` и `routing` поверх шаблона из `xray/config.json.example`.
+Заполнить `xray/config.json` данными своего сервера. Оставьте `XRAY_SUBSCRIPTION_URL` пустым — скрипт не будет перезаписывать файл.
 
 ### Поддерживаемые протоколы
 
-| Протокол | Примечание |
-|----------|-----------|
-| VLESS + REALITY | рекомендуется (как в happ по умолчанию) |
-| VLESS + TLS | стандартный VLESS |
-| VMess | классический протокол xray/v2ray |
-| Trojan | |
-| Shadowsocks | |
+| Протокол | Транспорт |
+|----------|----------|
+| VLESS + REALITY | tcp (как в happ по умолчанию) |
+| VLESS + TLS | tcp, ws, grpc, h2 |
+| VMess | tcp, ws, grpc, h2 |
+| Trojan | tcp, ws |
+| Shadowsocks | tcp |
+
+### Переменные окружения xray
+
+| Переменная | По умолчанию | Описание |
+|------------|-------------|---------|
+| `XRAY_SUBSCRIPTION_URL` | — | URL подписки провайдера |
+| `XRAY_SERVER_INDEX` | `0` | Индекс сервера в списке подписки |
+| `XRAY_SOCKS_PORT` | `10808` | Локальный порт SOCKS5 |
+| `TELEGRAM_PROXY` | — | Адрес proxy для Telegram API |
 
 ### Отключение xray
 
-Удалите или переименуйте `xray/config.json` и очистите переменную:
+Очистите переменные и удалите/не создавайте `xray/config.json`:
 
 ```dotenv
+XRAY_SUBSCRIPTION_URL=
 TELEGRAM_PROXY=
 ```
 
-Supervisord обнаружит отсутствие файла, пропустит запуск xray и воркер выйдет в интернет напрямую.
+Supervisord пропустит запуск xray, воркер выйдет в интернет напрямую.
 
 ---
 

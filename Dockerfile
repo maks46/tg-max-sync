@@ -27,7 +27,7 @@ RUN ARCH=$(uname -m) && \
     curl -fsSL \
       "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip" \
       -o /tmp/xray.zip && \
-    unzip -q /tmp/xray.zip xray -d /usr/local/bin/ && \
+    unzip -q /tmp/xray.zip xray geoip.dat geosite.dat -d /usr/local/bin/ && \
     chmod +x /usr/local/bin/xray && \
     rm /tmp/xray.zip
 
